@@ -5,23 +5,22 @@ import pandas as pd
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-import numpy as np  # for safety, though not heavily used
+import numpy as np
 
 from solana.rpc.async_api import AsyncClient
 from anchorpy import Provider, Wallet
 from solders.keypair import Keypair
-from driftpy.drift_client import DriftClient
-from driftpy.constants import configs
+from driftpy.client import DriftClient
 from driftpy.drift_user import DriftUser
 from driftpy.types import PositionDirection
 
 load_dotenv()
 
-# Config from .env
+# Config from Railway environment variables
 PRIVATE_KEY_JSON = json.loads(os.getenv("PRIVATE_KEY_JSON"))
 RPC_URL = os.getenv("RPC_URL")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
-MARKET_INDEX = int(os.getenv("MARKET_INDEX", 0))  # SOL-PERP
+MARKET_INDEX = int(os.getenv("MARKET_INDEX", 0))          # SOL-PERP = 0
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.005))
 LEVERAGE = int(os.getenv("LEVERAGE", 8))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
@@ -42,16 +41,22 @@ async def get_candles(limit=200):
         "x-chain": "solana",
         "x-api-key": BIRDEYE_API_KEY
     }
-    resp = requests.get(url, params=params, headers=headers)
-    if resp.status_code != 200:
-        raise Exception(f"Birdeye API error: {resp.text}")
-    data = resp.json()["data"]["items"]
-    df = pd.DataFrame(data)
-    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-    df["timestamp"] = pd.to_datetime(df["unixTime"], unit="s")
-    return df[["open", "high", "low", "close", "volume"]].astype(float)
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()["data"]["items"]
+        df = pd.DataFrame(data)
+        df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+        df["timestamp"] = pd.to_datetime(df["unixTime"], unit="s")
+        return df[["open", "high", "low", "close", "volume"]].astype(float)
+    except Exception as e:
+        print(f"Failed to fetch candles: {e}")
+        return None
 
 def calculate_indicators(df):
+    if df is None or len(df) < 50:  # Need enough data for MACD
+        return None
+
     # EMA
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
@@ -73,18 +78,28 @@ def calculate_indicators(df):
     return df
 
 async def main():
+    # Wallet & Connection
     keypair = Keypair.from_secret_key(bytes(PRIVATE_KEY_JSON))
     wallet = Wallet(keypair)
     connection = AsyncClient(RPC_URL)
     provider = Provider(connection, wallet)
-    from driftpy.constants.config import mainnet  # This is the common current import for configs
 
-drift_client = DriftClient(
-    config=mainnet,  # or DriftClient.from_config(mainnet, ...)
-    provider=provider,
-    perp_market_indexes=[MARKET_INDEX]
-)
-await drift_client.subscribe()
+    print("Initializing DriftClient...")
+
+    # Modern DriftClient initialization (no deprecated configs import)
+    drift_client = DriftClient(
+        connection=connection,
+        wallet=wallet,
+        env="mainnet-beta",                    # or "mainnet" — try "mainnet" if this fails
+        perp_market_indexes=[MARKET_INDEX]
+    )
+
+    try:
+        await drift_client.subscribe()
+        print("DriftClient subscribed successfully")
+    except Exception as e:
+        print(f"Failed to subscribe DriftClient: {e}")
+        return
 
     drift_user = DriftUser(drift_client)
     print(f"🚀 Bot started | Collateral: {await drift_user.get_total_collateral():.2f} USDC")
@@ -95,18 +110,26 @@ await drift_client.subscribe()
     while True:
         try:
             df = await get_candles()
+            if df is None:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
             df = calculate_indicators(df)
+            if df is None:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # Long signal: price above EMAs + RSI cross up from <25 + MACD hist cross up from negative
+            # Long signal
             long_signal = (
                 latest["close"] > latest["ema9"] > latest["ema21"] and
                 prev["rsi9"] < 25 <= latest["rsi9"] and
                 prev["macd_hist"] < 0 <= latest["macd_hist"]
             )
 
-            # Short signal: mirror
+            # Short signal
             short_signal = (
                 latest["close"] < latest["ema9"] < latest["ema21"] and
                 prev["rsi9"] > 75 >= latest["rsi9"] and
@@ -114,12 +137,20 @@ await drift_client.subscribe()
             )
 
             user_positions = await drift_user.get_user_positions()
-            has_position = any(p.market_index == MARKET_INDEX and abs(p.base_asset_amount) > 0 for p in user_positions)
+            has_position = any(
+                p.market_index == MARKET_INDEX and abs(p.base_asset_amount) > 0
+                for p in user_positions
+            )
 
             if not has_position:
                 collateral = await drift_user.get_total_collateral()
-                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2  # conservative
-                size_base = int(size_usd / latest["close"] * 1e9)  # Drift precision
+                if collateral <= 0:
+                    print("No collateral available — skipping trade")
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+
+                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2  # conservative sizing
+                size_base = int(size_usd / latest["close"] * 1e9)      # Drift base asset precision
 
                 if long_signal:
                     await drift_client.open_position(PositionDirection.LONG(), size_base, MARKET_INDEX)
@@ -137,11 +168,12 @@ await drift_client.subscribe()
                 await drift_client.close_position(MARKET_INDEX)
                 print(f"🔄 {position_side} CLOSED on opposite signal")
                 in_position = False
+                position_side = None
 
             await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Loop error: {e}")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
