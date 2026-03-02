@@ -1,5 +1,5 @@
 [build]
-  nixpacksPlan = { providers = ["python"] }
-
-[deploy]
-  startCommand = "python bot.py"   # Explicit if auto-detect fails
+  nixpacksPlan = {
+    providers = ["python"],
+    python = { version = "3.11" }
+  }
