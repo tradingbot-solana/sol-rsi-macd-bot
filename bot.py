@@ -16,11 +16,11 @@ from driftpy.types import PositionDirection
 
 load_dotenv()
 
-# Config from Railway environment variables
+# Config from env vars
 PRIVATE_KEY_JSON = json.loads(os.getenv("PRIVATE_KEY_JSON"))
 RPC_URL = os.getenv("RPC_URL")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
-MARKET_INDEX = int(os.getenv("MARKET_INDEX", 0))          # SOL-PERP = 0
+MARKET_INDEX = int(os.getenv("MARKET_INDEX", 0))  # SOL-PERP
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.005))
 LEVERAGE = int(os.getenv("LEVERAGE", 8))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
@@ -54,21 +54,18 @@ async def get_candles(limit=200):
         return None
 
 def calculate_indicators(df):
-    if df is None or len(df) < 50:  # Need enough data for MACD
+    if df is None or len(df) < 50:
         return None
 
-    # EMA
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
-    # RSI(9)
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=9).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=9).mean()
     rs = gain / loss
     df['rsi9'] = 100 - (100 / (1 + rs))
 
-    # MACD(12,26,9)
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd_line'] = ema12 - ema26
@@ -78,31 +75,32 @@ def calculate_indicators(df):
     return df
 
 async def main():
-    # Wallet & Connection
+    print("Starting bot initialization...")
+
     keypair = Keypair.from_secret_key(bytes(PRIVATE_KEY_JSON))
     wallet = Wallet(keypair)
     connection = AsyncClient(RPC_URL)
     provider = Provider(connection, wallet)
 
-    print("Initializing DriftClient...")
+    print("Creating DriftClient...")
 
-    # Modern DriftClient initialization (no deprecated configs import)
     drift_client = DriftClient(
         connection=connection,
         wallet=wallet,
-        env="mainnet-beta",                    # or "mainnet" — try "mainnet" if this fails
+        env="mainnet-beta",
         perp_market_indexes=[MARKET_INDEX]
     )
 
     try:
         await drift_client.subscribe()
-        print("DriftClient subscribed successfully")
+        print("DriftClient subscribed OK")
     except Exception as e:
-        print(f"Failed to subscribe DriftClient: {e}")
+        print(f"Subscribe failed: {e}")
         return
 
     drift_user = DriftUser(drift_client)
-    print(f"🚀 Bot started | Collateral: {await drift_user.get_total_collateral():.2f} USDC")
+    collateral = await drift_user.get_total_collateral()
+    print(f"🚀 Bot started | Collateral: {collateral:.2f} USDC")
 
     in_position = False
     position_side = None
@@ -122,14 +120,12 @@ async def main():
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # Long signal
             long_signal = (
                 latest["close"] > latest["ema9"] > latest["ema21"] and
                 prev["rsi9"] < 25 <= latest["rsi9"] and
                 prev["macd_hist"] < 0 <= latest["macd_hist"]
             )
 
-            # Short signal
             short_signal = (
                 latest["close"] < latest["ema9"] < latest["ema21"] and
                 prev["rsi9"] > 75 >= latest["rsi9"] and
@@ -145,28 +141,28 @@ async def main():
             if not has_position:
                 collateral = await drift_user.get_total_collateral()
                 if collateral <= 0:
-                    print("No collateral available — skipping trade")
+                    print("No collateral - skipping")
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2  # conservative sizing
-                size_base = int(size_usd / latest["close"] * 1e9)      # Drift base asset precision
+                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2
+                size_base = int(size_usd / latest["close"] * 1e9)
 
                 if long_signal:
                     await drift_client.open_position(PositionDirection.LONG(), size_base, MARKET_INDEX)
-                    print(f"✅ LONG opened @ ~${latest['close']:.2f} | Size ~${size_usd:.0f}")
+                    print(f"✅ LONG @ ~${latest['close']:.2f} | Size ~${size_usd:.0f}")
                     in_position = True
                     position_side = "LONG"
 
                 elif short_signal:
                     await drift_client.open_position(PositionDirection.SHORT(), size_base, MARKET_INDEX)
-                    print(f"✅ SHORT opened @ ~${latest['close']:.2f} | Size ~${size_usd:.0f}")
+                    print(f"✅ SHORT @ ~${latest['close']:.2f} | Size ~${size_usd:.0f}")
                     in_position = True
                     position_side = "SHORT"
 
             elif has_position and ((position_side == "LONG" and short_signal) or (position_side == "SHORT" and long_signal)):
                 await drift_client.close_position(MARKET_INDEX)
-                print(f"🔄 {position_side} CLOSED on opposite signal")
+                print(f"🔄 {position_side} CLOSED")
                 in_position = False
                 position_side = None
 
