@@ -2,10 +2,10 @@ import asyncio
 import json
 import os
 import pandas as pd
-import pandas_ta as ta
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
+import numpy as np  # for safety, though not heavily used
 
 from solana.rpc.async_api import AsyncClient
 from anchorpy import Provider, Wallet
@@ -13,19 +13,18 @@ from solana.keypair import Keypair
 from driftpy.drift_client import DriftClient
 from driftpy.constants import configs
 from driftpy.drift_user import DriftUser
-from driftpy.math.amm import calculate_mark_price
 from driftpy.types import PositionDirection
 
 load_dotenv()
 
-# Config
+# Config from .env
 PRIVATE_KEY_JSON = json.loads(os.getenv("PRIVATE_KEY_JSON"))
 RPC_URL = os.getenv("RPC_URL")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
-MARKET_INDEX = int(os.getenv("MARKET_INDEX"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE"))
-LEVERAGE = int(os.getenv("LEVERAGE"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))
+MARKET_INDEX = int(os.getenv("MARKET_INDEX", 0))  # SOL-PERP
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.005))
+LEVERAGE = int(os.getenv("LEVERAGE", 8))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 
 SOL_ADDRESS = "So11111111111111111111111111111111111111112"
 
@@ -44,22 +43,36 @@ async def get_candles(limit=200):
         "x-api-key": BIRDEYE_API_KEY
     }
     resp = requests.get(url, params=params, headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Birdeye API error: {resp.text}")
     data = resp.json()["data"]["items"]
     df = pd.DataFrame(data)
     df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     df["timestamp"] = pd.to_datetime(df["unixTime"], unit="s")
     return df[["open", "high", "low", "close", "volume"]].astype(float)
 
-async def get_indicators(df):
-    df["ema9"] = ta.ema(df.close, length=9)
-    df["ema21"] = ta.ema(df.close, length=21)
-    df["rsi9"] = ta.rsi(df.close, length=9)
-    macd = ta.macd(df.close, fast=12, slow=26, signal=9)
-    df = pd.concat([df, macd], axis=1)
+def calculate_indicators(df):
+    # EMA
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+
+    # RSI(9)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=9).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=9).mean()
+    rs = gain / loss
+    df['rsi9'] = 100 - (100 / (1 + rs))
+
+    # MACD(12,26,9)
+    ema12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd_line'] = ema12 - ema26
+    df['macd_signal'] = df['macd_line'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd_line'] - df['macd_signal']
+
     return df
 
 async def main():
-    # Wallet & Client
     keypair = Keypair.from_secret_key(bytes(PRIVATE_KEY_JSON))
     wallet = Wallet(keypair)
     connection = AsyncClient(RPC_URL)
@@ -77,27 +90,31 @@ async def main():
     while True:
         try:
             df = await get_candles()
-            df = await get_indicators(df)
+            df = calculate_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # Signals (exact from our strategy)
-            long_signal = (latest["close"] > latest["ema9"] > latest["ema21"] and
-                           prev["rsi9"] < 25 <= latest["rsi9"] and
-                           prev["MACDh_12_26_9"] < 0 <= latest["MACDh_12_26_9"])
+            # Long signal: price above EMAs + RSI cross up from <25 + MACD hist cross up from negative
+            long_signal = (
+                latest["close"] > latest["ema9"] > latest["ema21"] and
+                prev["rsi9"] < 25 <= latest["rsi9"] and
+                prev["macd_hist"] < 0 <= latest["macd_hist"]
+            )
 
-            short_signal = (latest["close"] < latest["ema9"] < latest["ema21"] and
-                            prev["rsi9"] > 75 >= latest["rsi9"] and
-                            prev["MACDh_12_26_9"] > 0 >= latest["MACDh_12_26_9"])
+            # Short signal: mirror
+            short_signal = (
+                latest["close"] < latest["ema9"] < latest["ema21"] and
+                prev["rsi9"] > 75 >= latest["rsi9"] and
+                prev["macd_hist"] > 0 >= latest["macd_hist"]
+            )
 
             user_positions = await drift_user.get_user_positions()
             has_position = any(p.market_index == MARKET_INDEX and abs(p.base_asset_amount) > 0 for p in user_positions)
 
-            # Entry
             if not has_position:
                 collateral = await drift_user.get_total_collateral()
-                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2  # conservative sizing
-                size_base = int(size_usd / latest["close"] * 1e9)  # Drift base precision
+                size_usd = collateral * LEVERAGE * RISK_PER_TRADE * 2  # conservative
+                size_base = int(size_usd / latest["close"] * 1e9)  # Drift precision
 
                 if long_signal:
                     await drift_client.open_position(PositionDirection.LONG(), size_base, MARKET_INDEX)
@@ -111,7 +128,6 @@ async def main():
                     in_position = True
                     position_side = "SHORT"
 
-            # Exit (opposite signal or simple 20-min timeout logic can be added)
             elif has_position and ((position_side == "LONG" and short_signal) or (position_side == "SHORT" and long_signal)):
                 await drift_client.close_position(MARKET_INDEX)
                 print(f"🔄 {position_side} CLOSED on opposite signal")
