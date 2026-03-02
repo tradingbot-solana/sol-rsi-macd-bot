@@ -77,9 +77,14 @@ async def main():
     wallet = Wallet(keypair)
     connection = AsyncClient(RPC_URL)
     provider = Provider(connection, wallet)
-    config = configs["mainnet"]
-    drift_client = DriftClient.from_config(config, provider, perp_market_indexes=[MARKET_INDEX])
-    await drift_client.subscribe()
+    from driftpy.constants.config import mainnet  # This is the common current import for configs
+
+drift_client = DriftClient(
+    config=mainnet,  # or DriftClient.from_config(mainnet, ...)
+    provider=provider,
+    perp_market_indexes=[MARKET_INDEX]
+)
+await drift_client.subscribe()
 
     drift_user = DriftUser(drift_client)
     print(f"🚀 Bot started | Collateral: {await drift_user.get_total_collateral():.2f} USDC")
